@@ -1,14 +1,13 @@
-# bond_lab_lite.py
+# bond_lab_lite.py — CORE
 # ---------------------------------------------------------
-# Bond Evaluation & Analysis Lab — LITE (clean & pro)
-# ---------------------------------------------------------
-# Features:
-# 1) Pricing: YTM (APR/EAR), Clean/Dirty, Accrued, Duration/Convexity/DV01
-# 2) Zero-Kurve ohne Upload: Flat / Steigend / Invers (kurz/ lang justierbar)
-# 3) Z-Spread gegen gewählte Kurve
-# 4) Credit: implizite Hazard-Rate (FRP), PD 1/3/5Y, Survival-Kurve
-# 5) Carry: Pull-to-Par (24M)
-# 6) Stress (Tornado): Yield ±100bp, Z-Spread ±100bp, Recovery 10/40, λ x0.5/x1.5
+# Kernfunktionen mit schlanker UI:
+# - Pricing (Clean/Dirty), APR/EAR, Macaulay/Modified, Convexity, DV01
+# - Zero-Kurve (Flat/Steigend/Invers) ohne Upload
+# - Z-Spread vs Kurve
+# - Credit: implizite Hazard (FRP), PD 1/3/5Y, Survival
+# - Horizon-Return (12/24M) mit Wiederveranlagung: Zero-Kurve ODER Geldmarktsatz
+# - Tornado (Yield ±100bp, Z-Spread ±100bp, Recovery 10/40, λ x0.5/x1.5)
+# - Grafiken: Price↔Yield, Zero vs Zero+Z, Survival, Tornado (nur Essentials)
 
 from __future__ import annotations
 from datetime import date
@@ -22,14 +21,13 @@ import streamlit as st
 try:
     from dateutil.relativedelta import relativedelta
 except Exception:
-    class relativedelta:  # minimal fallback
+    class relativedelta:
         def __init__(self, months=0, years=0): self._months = months + 12*years
 
 # =========================
 # Zero curve (no upload)
 # =========================
 def build_zero_curve(mode: str, bench_flat_pct: float, r_short_pct: float = 2.5, r_long_pct: float = 3.5):
-    """Return (tenors in years, zero rates in decimals)."""
     tenors = np.array([0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 30], dtype=float)
     if mode == "Flat":
         rates = np.full_like(tenors, bench_flat_pct/100.0, dtype=float)
@@ -64,8 +62,7 @@ def year_fraction(d1: date, d2: date, conv: str, period_start: date | None = Non
         y1,m1,d1_ = d1.year, d1.month, min(d1.day, 30)
         y2,m2,d2_ = d2.year, d2.month, min(d2.day, 30)
         return (360*(y2-y1) + 30*(m2-m1) + (d2_-d1_)) / 360.0
-    # ACT/ACT (simple)
-    return (d2 - d1).days / 365.0
+    return (d2 - d1).days / 365.0  # simple ACT/ACT fallback
 
 def build_schedule(settlement: date, maturity: date, frequency: str):
     step = {"Annual":12, "Semiannual":6, "Quarterly":3, "Monthly":1}[frequency]
@@ -85,7 +82,7 @@ def accrued_interest(settlement: date, prev_coupon: date, next_coupon: date,
     per_year = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[frequency]
     coupon_amt = coupon_rate * nominal / per_year
     full = year_fraction(prev_coupon, next_coupon, day_count, prev_coupon, next_coupon)
-    run  = year_fraction(prev_coupon, settlement, day_count, prev_coupon, next_coupon)
+    run  = year_fraction(prev_coupon, settlement,   day_count, prev_coupon, next_coupon)
     frac = 0.0 if full <= 0 else max(0.0, min(1.0, run/full))
     return coupon_amt * frac
 
@@ -133,6 +130,9 @@ def duration_convexity(y_apr: float, settlement: date, cashflows, m: int, bp: fl
     dv01    = mod_dur * p0 * 1e-4
     return mod_dur, convex, dv01, p0
 
+def macaulay_duration(mod_dur: float, y_apr: float, m: int) -> float:
+    return mod_dur * (1 + y_apr/m)
+
 # =========================
 # Z-Spread & Hazard (FRP)
 # =========================
@@ -176,19 +176,69 @@ def solve_hazard_from_price(dirty_price: float, cashflows, settlement: date, t_n
         else: lo = mid
     return 0.5*(lo+hi)
 
-def pull_to_par_path(y_apr: float, settlement: date, cashflows, m: int, months: int = 24):
-    pts, cur = [], settlement
-    for k in range(months+1):
-        p = price_from_yield(y_apr, cur, cashflows, m)
-        pts.append((k, p))
-        cur = cur + relativedelta(months=1)
-    return pts
+# =========================
+# Horizon-Return mit Wiederveranlagung
+# =========================
+def horizon_return(months: int,
+                   settlement: date,
+                   maturity: date,
+                   coupon: float,
+                   nominal: float,
+                   freq: str,
+                   day_count: str,
+                   y_apr: float,
+                   reinvest_mode: str,          # "Zero-Kurve" | "Geldmarkt (fix)"
+                   cash_rate_apr: float,        # z.B. aktueller Geldmarktsatz
+                   t_nodes, r_nodes) -> float:
+    """
+    Brutto Total Return bis zum Horizont (Dirty zu Dirty), inkl. Wiederveranlagung der Coupons.
+    Annahme: Yield-Konstanz für Preis am Horizont.
+    """
+    m = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[freq]
+    flows_now, _, _ = build_cashflows(settlement, maturity, coupon, nominal, freq, day_count)
+
+    # 1) Horizon-Datum
+    horizon_dt = settlement + relativedelta(months=months)
+
+    # 2) Coupons bis Horizont und ihre Wiederveranlagung
+    FV_coupons = 0.0
+    for dt, amt in flows_now:
+        # isoliert den Couponanteil
+        is_mat = (dt == flows_now[-1][0])
+        cpn = amt - (nominal if is_mat else 0.0)
+        if cpn <= 0: 
+            continue
+        if dt <= horizon_dt:
+            # Restlaufzeit bis Horizont in Jahren
+            t_rem = (horizon_dt - dt).days/365.0
+            if t_rem <= 0:
+                FV_coupons += cpn
+            else:
+                if reinvest_mode == "Zero-Kurve":
+                    reinv_r = interp_zero(t_nodes, r_nodes, t_rem)
+                else:  # Geldmarkt (fix)
+                    reinv_r = cash_rate_apr
+                FV_coupons += cpn * math.exp(reinv_r * t_rem)
+
+    # 3) Preis der Rest-Cashflows am Horizont bei konstantem YTM
+    #    -> Reprice mit neuem Settlement = horizon_dt
+    future_flows, _, _ = build_cashflows(horizon_dt, maturity, coupon, nominal, freq, day_count)
+    P_hor = price_from_yield(y_apr, horizon_dt, future_flows, m)
+
+    # 4) Start-Dirty (heute)
+    per_year = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[freq]
+    # dirty today = model price from YTM (konsistent mit y_apr)
+    P0 = price_from_yield(y_apr, settlement, flows_now, per_year)
+
+    # 5) Total Return (Dirty zu Dirty)
+    TR = (P_hor + FV_coupons - P0) / P0
+    return TR
 
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Bond Lab — LITE", page_icon="💹", layout="wide")
-st.title("💹 Bond Lab — LITE")
+st.set_page_config(page_title="Bond Lab — LITE (Core)", page_icon="💹", layout="wide")
+st.title("💹 Bond Lab — LITE (Core)")
 
 with st.sidebar:
     st.header("Instrument")
@@ -204,8 +254,8 @@ with st.sidebar:
     st.subheader("Preis & Kurve")
     price_type = st.radio("Preis ist", ["Clean","Dirty"], index=0, horizontal=True)
     price_pct  = st.number_input("Preis (% vom Nominal)", value=20.00, step=0.01, format="%.4f")
-    bench_flat = st.number_input("Flat-Benchmark (% p.a.)", value=2.00, step=0.05)
     curve_mode = st.radio("Zero-Kurve", ["Flat","Steigend","Invers"], index=1, horizontal=True)
+    bench_flat = st.number_input("Flat-Benchmark (% p.a.)", value=2.00, step=0.05, format="%.2f")
     if curve_mode != "Flat":
         c1, c2 = st.columns(2)
         r_short = c1.number_input("Kurzfrist-Rate (%)", value=2.50, step=0.05, format="%.2f")
@@ -214,81 +264,90 @@ with st.sidebar:
         r_short = 2.50; r_long = 3.50
 
     st.divider()
+    st.subheader("Wiederveranlagung")
+    reinvest_mode = st.radio("Reinvest", ["Zero-Kurve", "Geldmarkt (fix)"], index=0, horizontal=True)
+    cash_rate = st.number_input("Geldmarktsatz (% p.a.)", value=2.50, step=0.05, format="%.2f")
+
+    st.divider()
     st.subheader("Credit")
     recovery = st.slider("Recovery (Anteil Par)", 0.0, 0.8, 0.20, 0.01)
 
-# presets (optional)
+# presets
 coupon = couponPct/100.0
 m      = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[freq]
 
 # Build flows & accrued
 flows, accrued, sched = build_cashflows(settlement, maturity, coupon, nominal, freq, day_count)
 accrued_pct = accrued/nominal*100.0
-if price_type == "Clean":
-    dirty_pct = price_pct + accrued_pct
-else:
-    dirty_pct = price_pct
+dirty_pct = price_pct + accrued_pct if price_type == "Clean" else price_pct
 dirty_abs = dirty_pct/100.0*nominal
 
-# Pricing & risk
+# Fit YTM to Dirty
 y_apr = ytm_from_price(dirty_abs, settlement, flows, m)
 y_ear = ear_from_apr(y_apr, m)
 mod_dur, convex, dv01, model_dirty = duration_convexity(y_apr, settlement, flows, m)
+mac_dur = macaulay_duration(mod_dur, y_apr, m)
 model_dirty_pct = model_dirty/nominal*100.0
 model_clean_pct = (model_dirty - accrued)/nominal*100.0
 
-# Zero curve
+# Zero curve & Z-Spread
 t_nodes, r_nodes = build_zero_curve(curve_mode, bench_flat, r_short, r_long)
+z = solve_z_spread(dirty_abs, flows, settlement, t_nodes, r_nodes)
 
-# Tabs
-tab_prc, tab_curve, tab_credit, tab_stress = st.tabs(["Pricing", "Curve & Z-Spread", "Credit", "Stress"])
+# Horizon-Returns (12/24M) — Reinvest an Zero-Kurve ODER fixem Geldmarktsatz
+reinv_mode_str = reinvest_mode
+cash_rate_apr  = cash_rate/100.0
+TR_12 = horizon_return(12, settlement, maturity, coupon, nominal, freq, day_count, y_apr,
+                       reinv_mode_str, cash_rate_apr, t_nodes, r_nodes)
+TR_24 = horizon_return(24, settlement, maturity, coupon, nominal, freq, day_count, y_apr,
+                       reinv_mode_str, cash_rate_apr, t_nodes, r_nodes)
 
-# --- Pricing
-with tab_prc:
-    c1, c2, c3 = st.columns(3)
+# Credit: implizite Hazard
+lam = solve_hazard_from_price(dirty_abs, flows, settlement, t_nodes, r_nodes, recovery, nominal)
+
+# Tabs (nur Essentials)
+tab_ov, tab_credit = st.tabs(["Overview", "Credit & Stress"])
+
+# -------- Overview
+with tab_ov:
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("YTM (APR)", f"{y_apr*100:.2f}%")
         st.metric("YTM (EAR)", f"{y_ear*100:.2f}%")
     with c2:
-        st.metric("Accrued (pro 100)", f"{accrued_pct:.4f}%")
         st.metric("Model Dirty", f"{model_dirty_pct:.2f}%")
         st.metric("Model Clean", f"{model_clean_pct:.2f}%")
     with c3:
+        st.metric("Macaulay Duration", f"{mac_dur:.3f}y")
         st.metric("Modified Duration", f"{mod_dur:.3f}")
+    with c4:
         st.metric("Convexity", f"{convex:.3f}")
         st.metric("DV01", f"{dv01:.4f}")
 
+    c5, c6 = st.columns(2)
+    with c5:
+        st.metric("Z-Spread", f"{z*10000:.0f} bp")
+    with c6:
+        st.metric("Accrued (pro 100)", f"{accrued_pct:.4f}%")
+
     st.divider()
-    st.subheader("Cashflows (jährlich, Coupon vs Tilgung) & PV")
+    st.subheader("Horizon Total Return (Dirty→Dirty) mit Wiederveranlagung")
+    c7, c8, c9 = st.columns(3)
+    with c7:
+        st.metric("Reinvest-Modus", reinvest_mode)
+    with c8:
+        st.metric("Geldmarktsatz (fix)", f"{cash_rate:.2f}% p.a.")
+    with c9:
+        st.metric("Zero-Kurve: Kurz/Lang", f"{r_short:.2f}% / {r_long:.2f}%")
 
-    # annual aggregate for clarity
-    last_dt = sched[-1]
-    rows = []
-    for dt, amt in flows:
-        is_mat = (dt == last_dt)
-        cpn = amt - (nominal if is_mat else 0.0)
-        prin = nominal if is_mat else 0.0
-        t = (pd.Timestamp(dt) - pd.Timestamp(settlement)).days/365.0
-        dfy = math.exp(-math.log(1 + y_apr/m) * (m*t))
-        rows.append({"year": pd.Timestamp(dt).year,
-                     "coupon": cpn, "principal": prin,
-                     "pv_coupon": cpn*dfy, "pv_principal": prin*dfy})
-    agg = pd.DataFrame(rows).groupby("year", as_index=False).sum()
+    d1, d2 = st.columns(2)
+    d1.metric("12M Horizon TR", f"{TR_12*100:.2f}%")
+    d2.metric("24M Horizon TR", f"{TR_24*100:.2f}%")
 
-    fig_cf = go.Figure()
-    fig_cf.add_bar(x=agg["year"], y=agg["coupon"],    name="Coupons")
-    fig_cf.add_bar(x=agg["year"], y=agg["principal"], name="Tilgung", opacity=0.6)
-    fig_cf.update_layout(template="plotly_white", height=320, barmode="group", yaxis_title="Betrag")
-    st.plotly_chart(fig_cf, use_container_width=True)
-
-    fig_pv = go.Figure()
-    fig_pv.add_bar(x=agg["year"], y=agg["pv_coupon"],    name="PV Coupons")
-    fig_pv.add_bar(x=agg["year"], y=agg["pv_principal"], name="PV Tilgung")
-    fig_pv.update_layout(template="plotly_white", height=300, barmode="stack", yaxis_title="Present Value")
-    st.plotly_chart(fig_pv, use_container_width=True)
-
+    st.divider()
+    # Chart 1: Price ↔ Yield
     st.subheader("Price ↔ Yield")
-    ys = np.linspace(0.0, max(2.0, y_apr*1.2), 220)
+    ys = np.linspace(0.0, max(2.0, y_apr*1.2), 240)
     prices = [price_from_yield(y, settlement, flows, m)/nominal*100.0 for y in ys]
     fig_py = go.Figure()
     fig_py.add_trace(go.Scatter(x=ys*100, y=prices, name="Dirty Price", mode="lines"))
@@ -296,12 +355,10 @@ with tab_prc:
     fig_py.update_layout(template="plotly_white", height=320, xaxis_title="Yield (APR, %)", yaxis_title="Price (% of Par)")
     st.plotly_chart(fig_py, use_container_width=True)
 
-# --- Curve & Spread
-with tab_curve:
-    z = solve_z_spread(dirty_abs, flows, settlement, t_nodes, r_nodes)
-    st.metric("Z-Spread", f"{z*10000:.0f} bp")
-
-    ts = np.linspace(0.0, max((sched[-1]-settlement).days/365.0, t_nodes[-1]), 60)
+    # Chart 2: Zero vs Zero+Z
+    st.subheader("Zero-Kurve vs Zero+Z")
+    T_end = max((sched[-1]-settlement).days/365.0, t_nodes[-1])
+    ts = np.linspace(0.0, T_end, 70)
     base = [interp_zero(t_nodes, r_nodes, t)*100 for t in ts]
     plus = [(interp_zero(t_nodes, r_nodes, t)+z)*100 for t in ts]
     fig_curve = go.Figure()
@@ -310,34 +367,24 @@ with tab_curve:
     fig_curve.update_layout(template="plotly_white", height=320, xaxis_title="t (Jahre)", yaxis_title="Rate (% p.a.)")
     st.plotly_chart(fig_curve, use_container_width=True)
 
-# --- Credit
+# -------- Credit & Stress
 with tab_credit:
-    lam = solve_hazard_from_price(dirty_abs, flows, settlement, t_nodes, r_nodes, recovery, nominal)
-    c1,c2,c3 = st.columns(3)
+    c1,c2,c3,c4 = st.columns(4)
     c1.metric("Implizite Hazard λ", f"{lam*100:.2f}% p.a.")
     c2.metric("PD 1Y", f"{(1-math.exp(-lam*1.0))*100:.2f}%")
     c3.metric("PD 3Y", f"{(1-math.exp(-lam*3.0))*100:.2f}%")
-    st.metric("PD 5Y", f"{(1-math.exp(-lam*5.0))*100:.2f}%")
+    c4.metric("PD 5Y", f"{(1-math.exp(-lam*5.0))*100:.2f}%")
 
-    # Survival curve
-    T_end = (sched[-1] - settlement).days/365.0
-    Ts = np.linspace(0, T_end, 60)
+    # Chart 3: Survival
+    st.subheader("Survival-Kurve S(t)")
+    Ts = np.linspace(0, (sched[-1]-settlement).days/365.0, 60)
     S  = [math.exp(-lam*t) for t in Ts]
     figS = go.Figure(go.Scatter(x=Ts, y=S, mode="lines", name="S(t)"))
-    figS.update_layout(template="plotly_white", height=300, xaxis_title="t (Jahre)", yaxis_title="Survival S(t)")
+    figS.update_layout(template="plotly_white", height=300, xaxis_title="t (Jahre)", yaxis_title="S(t)")
     st.plotly_chart(figS, use_container_width=True)
 
-    # Pull-to-par (24M)
-    st.subheader("Pull-to-Par (24 Monate, konst. APR)")
-    path = pull_to_par_path(y_apr, settlement, flows, m, months=24)
-    fig_pull = go.Figure(go.Scatter(x=[k for k,_ in path], y=[p/nominal*100.0 for _,p in path], mode="lines+markers"))
-    fig_pull.add_hline(y=100.0, line_dash="dot", annotation_text="Par")
-    fig_pull.update_layout(template="plotly_white", height=300, xaxis_title="Monate", yaxis_title="Price (% of Par)")
-    st.plotly_chart(fig_pull, use_container_width=True)
-
-# --- Stress
-with tab_stress:
-    st.subheader("Tornado — ΔPrice (Dirty) in Punkten")
+    st.divider()
+    st.subheader("Tornado — ΔPrice (Dirty) in Punkten (Essentials)")
     scenarios = []
 
     y_up = price_from_yield(y_apr+0.01, settlement, flows, m)
@@ -361,8 +408,8 @@ with tab_stress:
 
     sc = pd.DataFrame(scenarios, columns=["Szenario","ΔPrice"]).sort_values("ΔPrice")
     fig_t = go.Figure(go.Bar(x=sc["ΔPrice"], y=sc["Szenario"], orientation="h"))
-    fig_t.update_layout(template="plotly_white", height=380, xaxis_title="ΔPrice (Prozentpunkte)",
+    fig_t.update_layout(template="plotly_white", height=360, xaxis_title="ΔPrice (Prozentpunkte)",
                         margin=dict(l=120, r=40, t=30, b=40))
     st.plotly_chart(fig_t, use_container_width=True)
 
-st.caption("© Bond Lab — LITE. Diskrete Verzinsung (m=Frequenz). Hazard via FRP-Approximation. Z-Spread gegen gewählte Zero-Kurve.")
+st.caption("© Bond Lab — LITE (Core). Diskrete Verzinsung m=Frequenz. Z-Spread gegen gewählte Zero-Kurve. Hazard via FRP.")
