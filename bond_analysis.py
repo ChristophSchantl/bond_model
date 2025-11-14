@@ -355,11 +355,20 @@ with tab_pricing:
 
     st.divider()
     st.subheader("Cashflow-Timeline & PV-Profile")
-    cf_df = pd.DataFrame({"date": [d for d, _ in cashflows], "cf": [a for _, a in cashflows]})
-    cf_df["t_years"] = (cf_df["date"] - pd.Timestamp(settlement)).dt.days / 365.0
-    # Diskontierung auf APR-Basis
+    # --- Cashflow-Timeline & PV-Profile (fix: ensure datetime64) ---
+    cf_df = pd.DataFrame({
+        "date": [pd.Timestamp(d) for d, _ in cashflows],  # -> datetime64[ns]
+        "cf":   [a for _, a in cashflows]
+    })
+    settle_ts = pd.Timestamp(settlement)
+    
+    # Zeit in Jahren seit Settlement
+    cf_df["t_years"] = (cf_df["date"] - settle_ts).dt.days / 365.0
+    
+    # Diskontfaktoren auf APR-Basis
     cf_df["df_yield"] = np.exp(-np.log(1 + y_apr / m) * (m * cf_df["t_years"]))
     cf_df["pv"] = cf_df["cf"] * cf_df["df_yield"]
+
 
     fig_cf = go.Figure()
     fig_cf.add_bar(x=cf_df["date"], y=cf_df["cf"], name="Cashflows")
