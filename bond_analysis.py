@@ -1,16 +1,15 @@
 # bond_lab_lite_core_cf.py
 # ---------------------------------------------------------
 # Bond Evaluation & Analysis Lab — LITE (Core + Investment & Cashflows)
-# Kernfeatures:
+# ---------------------------------------------------------
 # - Pricing (Clean/Dirty), APR/EAR, Macaulay/Modified, Convexity, DV01
 # - Zero-Kurve (Flat/Steigend/Invers) ohne Upload
 # - Z-Spread vs gewählte Kurve
 # - Credit: implizite Hazard (FRP), PD 1/3/5Y, Survival
 # - Horizon-Return (12/24M) mit Wiederveranlagung (Zero-Kurve ODER Geldmarkt fix)
-# - NEU: Gesamtverzinsung bis Fälligkeit (Dirty→Dirty), MOIC & Endwert
+# - Gesamtverzinsung bis Fälligkeit (Dirty→Dirty), MOIC & Endwert
 # - Investment: Investitionsbetrag → Stückzahl (ganzzahlig/Bruchteil), Cashflow-Tabelle
-# - Cashflow-Aggregation nach Monat/Jahr + Timeline-Chart
-# - Grafiken: Price↔Yield, Zero vs Zero+Z, Survival, Tornado
+# - Cashflow-Aggregation nach Monat/Jahr + Timeline-Chart (2 Y-Achsen)
 
 from __future__ import annotations
 from datetime import date
@@ -182,7 +181,7 @@ def solve_hazard_from_price(dirty_price: float, cashflows, settlement: date, t_n
     return 0.5*(lo+hi)
 
 # =========================
-# Horizon- & Gesamt-Return
+# Horizon- & Gesamt-Return (mit Fix)
 # =========================
 def horizon_return(months: int,
                    settlement: date,
@@ -198,34 +197,42 @@ def horizon_return(months: int,
     """
     Brutto Total Return bis zum Horizont (Dirty→Dirty), inkl. Wiederveranlagung der Coupons.
     Annahme: Yield-Konstanz für Horizon-Preis.
+    WICHTIG: Horizont wird auf Fälligkeit gecappt; am Fälligkeitstag zählt der Nominalpreis.
     """
     m = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[freq]
     flows_now, _, _ = build_cashflows(settlement, maturity, coupon, nominal, freq, day_count)
 
-    horizon_dt = settlement + relativedelta(months=months)
+    # 1) Horizon-Datum clampen
+    raw_hor = settlement + relativedelta(months=months)
+    horizon_dt = raw_hor if raw_hor <= maturity else maturity
 
-    # Reinvest der Coupons bis Horizont
+    # 2) Kupons bis Horizont wiederveranlagen
     FV_coupons = 0.0
+    last_dt = flows_now[-1][0] if flows_now else maturity
     for dt, amt in flows_now:
-        is_mat = (dt == flows_now[-1][0])
+        is_mat = (dt == last_dt)
         cpn = amt - (nominal if is_mat else 0.0)
-        if cpn <= 0: 
+        if cpn <= 0:
             continue
         if dt <= horizon_dt:
-            t_rem = (horizon_dt - dt).days/365.0
+            t_rem = (horizon_dt - dt).days / 365.0
             if t_rem <= 0:
                 FV_coupons += cpn
             else:
                 reinv_r = interp_zero(t_nodes, r_nodes, t_rem) if reinvest_mode == "Zero-Kurve" else cash_rate_apr
                 FV_coupons += cpn * math.exp(reinv_r * t_rem)
 
-    # Preis der Rest-CFs am Horizont bei konstantem YTM
-    future_flows, _, _ = build_cashflows(horizon_dt, maturity, coupon, nominal, freq, day_count)
-    P_hor = price_from_yield(y_apr, horizon_dt, future_flows, m)
+    # 3) Preis am Horizont
+    if horizon_dt >= maturity:
+        P_hor = nominal
+    else:
+        future_flows, _, _ = build_cashflows(horizon_dt, maturity, coupon, nominal, freq, day_count)
+        P_hor = price_from_yield(y_apr, horizon_dt, future_flows, m)
 
-    # Start-Dirty heute (modellkonsistent)
+    # 4) Start-Dirty (konsistent)
     P0 = price_from_yield(y_apr, settlement, flows_now, m)
 
+    # 5) Total Return (Dirty→Dirty)
     return (P_hor + FV_coupons - P0) / P0
 
 def months_to_maturity(settlement: date, maturity: date) -> int:
@@ -378,6 +385,10 @@ df_year  = df_cf.groupby("Year", as_index=False)[["Coupon","Principal","Total"]]
 coupon_per_1 = (coupon * nominal) / m
 monthly_coupon_total = coupon_per_1 * units if m == 12 else None  # nur "Monthly" exakt "pro Monat"
 
+# Endwert-KPIs
+endwert_mit_reinvest = invested_dirty * MOIC_MAT if invested_dirty > 0 else 0.0
+endwert_ohne_reinvest = float(df_cf["Cum_Total"].iloc[-1]) if len(df_cf) else 0.0  # Summe realer Zahlungen ohne Reinvest
+
 # =========================
 # Tabs
 # =========================
@@ -437,8 +448,8 @@ with tab_credit:
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Implizite Hazard λ", f"{lam*100:.2f}% p.a.")
     c2.metric("PD 1Y", f"{(1-math.exp(-lam*1.0))*100:.2f}%")
-    c3.metric("PD 3Y", f"{(1-math.exp(-lam*3.0))*100:.2f}%")
-    c4.metric("PD 5Y", f"{(1-math.exp(-lam*5.0))*100:.2f}%")
+    c3.metric("PD 3Y", f="{:.2f}%".format((1-math.exp(-lam*3.0))*100))
+    c4.metric("PD 5Y", f="{:.2f}%".format((1-math.exp(-lam*5.0))*100))
 
     # Chart 3: Survival
     st.subheader("Survival-Kurve S(t)")
@@ -482,8 +493,8 @@ with tab_cf:
     if monthly_coupon_total is not None:
         st.metric("Monatskupon (gesamt)", f"{monthly_coupon_total:,.2f}")
 
-    endwert_mat = invested_dirty * MOIC_MAT if invested_dirty > 0 else 0.0
-    st.metric("Endwert bis Fälligkeit (modelliert)", f"{endwert_mat:,.2f}")
+    st.metric("Endwert bis Fälligkeit (modelliert, mit Reinvest)", f"{endwert_mit_reinvest:,.2f}")
+    st.metric("Endwert ohne Reinvest (reine Zahlungsreihe)", f"{endwert_ohne_reinvest:,.2f}")
 
     st.caption("Hinweis: Bei 'Ganzzahlige Stückzahl' wird abgerundet. Start-Cashflow = negativer Dirty-Kaufpreis.")
 
@@ -505,10 +516,8 @@ with tab_cf:
         use_container_width=True
     )
 
-    st.subheader("Cashflow Timeline (Monate)")
-
+    st.subheader("Cashflow Timeline (Monate) — 2 Y-Achsen")
     fig_cf = go.Figure()
-    
     # Kupons (linke Achse)
     fig_cf.add_trace(go.Bar(
         x=df_month["DateLabel"],
@@ -516,9 +525,8 @@ with tab_cf:
         name="Coupons",
         marker_color="steelblue",
         yaxis="y1",
-        opacity=0.8
+        opacity=0.85
     ))
-    
     # Tilgung (rechte Achse)
     fig_cf.add_trace(go.Bar(
         x=df_month["DateLabel"],
@@ -526,31 +534,18 @@ with tab_cf:
         name="Tilgung",
         marker_color="salmon",
         yaxis="y2",
-        opacity=0.6
+        opacity=0.65
     ))
-    
-    # Achsen-Layout
     fig_cf.update_layout(
         template="plotly_white",
         height=380,
         barmode="group",
         xaxis=dict(title="Monat"),
-        yaxis=dict(
-            title="Coupons (investitionsskaliert)",
-            showgrid=True,
-            zeroline=True
-        ),
-        yaxis2=dict(
-            title="Tilgung (investitionsskaliert)",
-            overlaying="y",
-            side="right",
-            showgrid=False,
-            zeroline=False
-        ),
+        yaxis=dict(title="Coupons (investitionsskaliert)", showgrid=True, zeroline=True),
+        yaxis2=dict(title="Tilgung (investitionsskaliert)", overlaying="y", side="right",
+                    showgrid=False, zeroline=False),
         legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0)", borderwidth=0)
     )
-    
     st.plotly_chart(fig_cf, use_container_width=True)
 
-
-st.caption("© Bond Lab — LITE (Core+CF). Preise in Nominalwährung; Dirty→Dirty-Logik; Reinvest gemäß Auswahl (Zero-Kurve oder Geldmarkt fix).")
+st.caption("© Bond Lab — LITE (Core+CF). Dirty→Dirty-Logik; Reinvest gemäß Auswahl (Zero-Kurve oder Geldmarkt fix); Horizon fixiert Fälligkeit korrekt.")
