@@ -354,31 +354,76 @@ with tab_pricing:
         st.metric("DV01", f"{dv01:.4f}")
 
     st.divider()
-    st.subheader("Cashflow-Timeline & PV-Profile")
-    # --- Cashflow-Timeline & PV-Profile (fix: ensure datetime64) ---
-    cf_df = pd.DataFrame({
-        "date": [pd.Timestamp(d) for d, _ in cashflows],  # -> datetime64[ns]
-        "cf":   [a for _, a in cashflows]
-    })
+    # --- Cashflow-Timeline & PV-Profile (verbessert) ---
+    from plotly.subplots import make_subplots
+    
+    # Cashflows in Coupon/Tilgung aufsplitten + PV je Komponente
+    rows = []
+    last_dt = cashflows[-1][0]
     settle_ts = pd.Timestamp(settlement)
     
-    # Zeit in Jahren seit Settlement
-    cf_df["t_years"] = (cf_df["date"] - settle_ts).dt.days / 365.0
+    for dt, amt in cashflows:
+        is_mat = (dt == last_dt)
+        cpn = amt - (nominal if is_mat else 0.0)
+        prin = (nominal if is_mat else 0.0)
+        t = (pd.Timestamp(dt) - settle_ts).days / 365.0
+        dfy = np.exp(-np.log(1 + y_apr / m) * (m * t))         # Diskont auf APR
+        rows.append({
+            "date": pd.Timestamp(dt),
+            "year": pd.Timestamp(dt).year,
+            "coupon": cpn,
+            "principal": prin,
+            "pv_coupon": cpn * dfy,
+            "pv_principal": prin * dfy
+        })
     
-    # Diskontfaktoren auf APR-Basis
-    cf_df["df_yield"] = np.exp(-np.log(1 + y_apr / m) * (m * cf_df["t_years"]))
-    cf_df["pv"] = cf_df["cf"] * cf_df["df_yield"]
-
-
-    fig_cf = go.Figure()
-    fig_cf.add_bar(x=cf_df["date"], y=cf_df["cf"], name="Cashflows")
-    fig_cf.update_layout(height=300, template="plotly_white", yaxis_title="Betrag")
+    cf = pd.DataFrame(rows)
+    
+    # UI: Aggregation & Skalierung
+    colA, colB = st.columns([2,1])
+    with colA:
+        agg_mode = st.radio("Aggregation", ["Monatlich", "Jährlich"], horizontal=True, index=1)
+    with colB:
+        yscale = st.radio("Skalierung", ["Linear", "Log"], horizontal=True)
+    
+    if agg_mode == "Jährlich":
+        plot_df = (cf.groupby("year", as_index=False)
+                     [["coupon","principal","pv_coupon","pv_principal"]].sum())
+        x_vals = plot_df["year"].astype(str)
+    else:
+        plot_df = cf.copy()
+        x_vals = plot_df["date"]
+    
+    # (1) Cashflows: Coupons vs Tilgung auf getrennten Achsen
+    fig_cf = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
+    fig_cf.add_bar(x=x_vals, y=plot_df["coupon"], name="Coupons", secondary_y=False)
+    fig_cf.add_bar(x=x_vals, y=plot_df["principal"], name="Tilgung", opacity=0.55, secondary_y=True)
+    fig_cf.update_layout(template="plotly_white", height=360, barmode="group")
+    fig_cf.update_yaxes(title_text="Coupons", secondary_y=False, type=("log" if yscale=="Log" else "linear"))
+    fig_cf.update_yaxes(title_text="Tilgung", secondary_y=True)
     st.plotly_chart(fig_cf, use_container_width=True)
-
+    
+    # (2) Present Values: gestapelt (Coupons + Tilgung)
     fig_pv = go.Figure()
-    fig_pv.add_bar(x=cf_df["date"], y=cf_df["pv"], name="Present Value")
-    fig_pv.update_layout(height=300, template="plotly_white", yaxis_title="Present Value")
+    fig_pv.add_bar(x=x_vals, y=plot_df["pv_coupon"], name="PV Coupons")
+    fig_pv.add_bar(x=x_vals, y=plot_df["pv_principal"], name="PV Tilgung")
+    fig_pv.update_layout(template="plotly_white", height=320, barmode="stack", yaxis_title="Present Value")
     st.plotly_chart(fig_pv, use_container_width=True)
+    
+    # (3) PV-Split (Donut)
+    pv_tot = plot_df[["pv_coupon","pv_principal"]].sum()
+    fig_pie = go.Figure(go.Pie(labels=["PV Coupons","PV Tilgung"], values=pv_tot.values, hole=0.45))
+    fig_pie.update_layout(template="plotly_white", height=300)
+    st.plotly_chart(fig_pie, use_container_width=True)
+    
+    # (4) Kumulative PV über die Zeit
+    cf_sorted = cf.sort_values("date").copy()
+    cf_sorted["pv_total"] = cf_sorted["pv_coupon"] + cf_sorted["pv_principal"]
+    cf_sorted["pv_cum"] = cf_sorted["pv_total"].cumsum()
+    fig_cum = go.Figure(go.Scatter(x=cf_sorted["date"], y=cf_sorted["pv_cum"], mode="lines", name="Cum PV"))
+    fig_cum.update_layout(template="plotly_white", height=300, yaxis_title="PV kumuliert")
+    st.plotly_chart(fig_cum, use_container_width=True)
+
 
     st.subheader("Price ↔ Yield")
     ys = np.linspace(0.0, max(2.0, y_apr * 1.2), 220)
