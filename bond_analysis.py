@@ -506,11 +506,51 @@ with tab_cf:
     )
 
     st.subheader("Cashflow Timeline (Monate)")
+
     fig_cf = go.Figure()
-    fig_cf.add_bar(x=df_month["DateLabel"], y=df_month["Coupon"], name="Coupons")
-    fig_cf.add_bar(x=df_month["DateLabel"], y=df_month["Principal"], name="Tilgung", opacity=0.6)
-    fig_cf.update_layout(template="plotly_white", height=320, barmode="stack",
-                         xaxis_title="Monat", yaxis_title="Betrag (investitionsskaliert)")
+    
+    # Kupons (linke Achse)
+    fig_cf.add_trace(go.Bar(
+        x=df_month["DateLabel"],
+        y=df_month["Coupon"],
+        name="Coupons",
+        marker_color="steelblue",
+        yaxis="y1",
+        opacity=0.8
+    ))
+    
+    # Tilgung (rechte Achse)
+    fig_cf.add_trace(go.Bar(
+        x=df_month["DateLabel"],
+        y=df_month["Principal"],
+        name="Tilgung",
+        marker_color="salmon",
+        yaxis="y2",
+        opacity=0.6
+    ))
+    
+    # Achsen-Layout
+    fig_cf.update_layout(
+        template="plotly_white",
+        height=380,
+        barmode="group",
+        xaxis=dict(title="Monat"),
+        yaxis=dict(
+            title="Coupons (investitionsskaliert)",
+            showgrid=True,
+            zeroline=True
+        ),
+        yaxis2=dict(
+            title="Tilgung (investitionsskaliert)",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            zeroline=False
+        ),
+        legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0)", borderwidth=0)
+    )
+    
     st.plotly_chart(fig_cf, use_container_width=True)
+
 
 st.caption("© Bond Lab — LITE (Core+CF). Preise in Nominalwährung; Dirty→Dirty-Logik; Reinvest gemäß Auswahl (Zero-Kurve oder Geldmarkt fix).")
