@@ -1,7 +1,7 @@
-# Try writing the file again after environment reset.
+
 from textwrap import dedent
 
-code = dedent('''
+
     # bond_lab_pro.py
     # ---------------------------------------------------------
     # Bond Evaluation & Analysis Lab — PRO
