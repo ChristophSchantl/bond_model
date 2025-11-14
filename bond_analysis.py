@@ -1,4 +1,17 @@
-# bond_lab_lite.py — CORE + Investment & Cashflow-Plan
+# bond_lab_lite_core_cf.py
+# ---------------------------------------------------------
+# Bond Evaluation & Analysis Lab — LITE (Core + Investment & Cashflows)
+# Kernfeatures:
+# - Pricing (Clean/Dirty), APR/EAR, Macaulay/Modified, Convexity, DV01
+# - Zero-Kurve (Flat/Steigend/Invers) ohne Upload
+# - Z-Spread vs gewählte Kurve
+# - Credit: implizite Hazard (FRP), PD 1/3/5Y, Survival
+# - Horizon-Return (12/24M) mit Wiederveranlagung (Zero-Kurve ODER Geldmarkt fix)
+# - NEU: Gesamtverzinsung bis Fälligkeit (Dirty→Dirty), MOIC & Endwert
+# - Investment: Investitionsbetrag → Stückzahl (ganzzahlig/Bruchteil), Cashflow-Tabelle
+# - Cashflow-Aggregation nach Monat/Jahr + Timeline-Chart
+# - Grafiken: Price↔Yield, Zero vs Zero+Z, Survival, Tornado
+
 from __future__ import annotations
 from datetime import date
 import math
@@ -7,14 +20,18 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# ---------- robuste Monatsarithmetik
 try:
     from dateutil.relativedelta import relativedelta
 except Exception:
-    class relativedelta:
+    class relativedelta:  # minimaler Fallback
         def __init__(self, months=0, years=0): self._months = months + 12*years
 
-# ---------------- Zero Curve
+# =========================
+# Zero curve (no upload)
+# =========================
 def build_zero_curve(mode: str, bench_flat_pct: float, r_short_pct: float = 2.5, r_long_pct: float = 3.5):
+    """Return (tenors in years, zero rates in decimals)."""
     tenors = np.array([0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 30], dtype=float)
     if mode == "Flat":
         rates = np.full_like(tenors, bench_flat_pct/100.0, dtype=float)
@@ -38,15 +55,18 @@ def interp_zero(t_nodes: np.ndarray, r_nodes: np.ndarray, t: float) -> float:
 def df_zero(t_nodes: np.ndarray, r_nodes: np.ndarray, t: float) -> float:
     return math.exp(-interp_zero(t_nodes, r_nodes, t) * t)
 
-# ---------------- Schedule & CF
+# =========================
+# Day count, schedule, cashflows
+# =========================
 def year_fraction(d1: date, d2: date, conv: str, period_start: date | None = None, period_end: date | None = None) -> float:
     c = conv.upper()
     if c in ("ACT/365", "ACT/365F"): return (d2 - d1).days / 365.0
-    if c in ("ACT/360",):           return (d2 - d1).days / 360.0
+    if c in ("ACT/360",):            return (d2 - d1).days / 360.0
     if c in ("30/360", "30E/360"):
         y1,m1,d1_ = d1.year, d1.month, min(d1.day, 30)
         y2,m2,d2_ = d2.year, d2.month, min(d2.day, 30)
         return (360*(y2-y1) + 30*(m2-m1) + (d2_-d1_)) / 360.0
+    # einfache ACT/ACT-Annäherung
     return (d2 - d1).days / 365.0
 
 def build_schedule(settlement: date, maturity: date, frequency: str):
@@ -83,7 +103,9 @@ def build_cashflows(settlement: date, maturity: date, coupon_rate: float, nomina
     ai = accrued_interest(settlement, prev_coupon, next_coupon, coupon_rate, nominal, frequency, day_count)
     return flows, ai, sched
 
-# ---------------- Pricing & Risk
+# =========================
+# Pricing & risk
+# =========================
 def discount_factor_y(y_apr: float, t: float, m: int) -> float:
     return 1.0 / ((1.0 + y_apr/m)**(m*t))
 
@@ -116,7 +138,9 @@ def duration_convexity(y_apr: float, settlement: date, cashflows, m: int, bp: fl
 def macaulay_duration(mod_dur: float, y_apr: float, m: int) -> float:
     return mod_dur * (1 + y_apr/m)
 
-# ---------------- Z-Spread & Hazard
+# =========================
+# Z-Spread & Hazard (FRP)
+# =========================
 def pv_zero_plus_z(cashflows, settlement: date, t_nodes, r_nodes, z: float) -> float:
     pv = 0.0
     for dt, cf in cashflows:
@@ -157,13 +181,30 @@ def solve_hazard_from_price(dirty_price: float, cashflows, settlement: date, t_n
         else: lo = mid
     return 0.5*(lo+hi)
 
-# ---------------- Horizon Total Return (unverändert)
-def horizon_return(months: int, settlement: date, maturity: date, coupon: float, nominal: float,
-                   freq: str, day_count: str, y_apr: float,
-                   reinvest_mode: str, cash_rate_apr: float, t_nodes, r_nodes) -> float:
+# =========================
+# Horizon- & Gesamt-Return
+# =========================
+def horizon_return(months: int,
+                   settlement: date,
+                   maturity: date,
+                   coupon: float,
+                   nominal: float,
+                   freq: str,
+                   day_count: str,
+                   y_apr: float,
+                   reinvest_mode: str,          # "Zero-Kurve" | "Geldmarkt (fix)"
+                   cash_rate_apr: float,        # z.B. aktueller Geldmarktsatz
+                   t_nodes, r_nodes) -> float:
+    """
+    Brutto Total Return bis zum Horizont (Dirty→Dirty), inkl. Wiederveranlagung der Coupons.
+    Annahme: Yield-Konstanz für Horizon-Preis.
+    """
     m = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[freq]
     flows_now, _, _ = build_cashflows(settlement, maturity, coupon, nominal, freq, day_count)
+
     horizon_dt = settlement + relativedelta(months=months)
+
+    # Reinvest der Coupons bis Horizont
     FV_coupons = 0.0
     for dt, amt in flows_now:
         is_mat = (dt == flows_now[-1][0])
@@ -177,12 +218,37 @@ def horizon_return(months: int, settlement: date, maturity: date, coupon: float,
             else:
                 reinv_r = interp_zero(t_nodes, r_nodes, t_rem) if reinvest_mode == "Zero-Kurve" else cash_rate_apr
                 FV_coupons += cpn * math.exp(reinv_r * t_rem)
+
+    # Preis der Rest-CFs am Horizont bei konstantem YTM
     future_flows, _, _ = build_cashflows(horizon_dt, maturity, coupon, nominal, freq, day_count)
     P_hor = price_from_yield(y_apr, horizon_dt, future_flows, m)
+
+    # Start-Dirty heute (modellkonsistent)
     P0 = price_from_yield(y_apr, settlement, flows_now, m)
+
     return (P_hor + FV_coupons - P0) / P0
 
-# ---------------- UI
+def months_to_maturity(settlement: date, maturity: date) -> int:
+    """Ganze Monate vom Settlement bis Fälligkeit."""
+    k, cur = 0, settlement
+    while cur < maturity:
+        cur = cur + relativedelta(months=1)
+        k += 1
+        if k > 2000: break
+    return k
+
+def total_return_to_maturity(settlement: date, maturity: date, coupon: float, nominal: float,
+                             freq: str, day_count: str, y_apr: float,
+                             reinvest_mode: str, cash_rate_apr: float,
+                             t_nodes, r_nodes) -> float:
+    """Dirty→Dirty Total Return bis Fälligkeit inkl. Wiederveranlagung gemäß Reinvest-Einstellung."""
+    months = months_to_maturity(settlement, maturity)
+    return horizon_return(months, settlement, maturity, coupon, nominal, freq, day_count,
+                          y_apr, reinvest_mode, cash_rate_apr, t_nodes, r_nodes)
+
+# =========================
+# Streamlit UI
+# =========================
 st.set_page_config(page_title="Bond Lab — LITE (Core+CF)", page_icon="💹", layout="wide")
 st.title("💹 Bond Lab — LITE (Core)")
 
@@ -190,7 +256,7 @@ with st.sidebar:
     st.header("Instrument")
     name      = st.text_input("Name", value="Urbanek Real Estate GmbH 10% 25/32")
     nominal   = st.number_input("Nominal (pro Stück)",  value=100.0, step=1.0, format="%.2f")
-    couponPct = st.number_input("Kupon (% p.a.)",      value=10.0, step=0.01, format="%.4f")
+    couponPct = st.number_input("Kupon (% p.a.)",       value=10.0, step=0.01, format="%.4f")
     freq      = st.selectbox("Kuponfrequenz", ["Monthly","Quarterly","Semiannual","Annual"], index=0)
     day_count = st.selectbox("Day-Count", ["ACT/ACT","ACT/365","ACT/360","30/360"], index=0)
     settlement= st.date_input("Settlement", value=date.today())
@@ -223,17 +289,17 @@ with st.sidebar:
     invest_amt = st.number_input("Investitionsbetrag (Währungseinheiten)", value=10000.0, step=100.0, format="%.2f")
     integer_pcs = st.checkbox("Ganzzahlige Stückzahl", value=True)
 
-# presets
+# ---- Presets
 coupon = couponPct/100.0
 m      = {"Annual":1,"Semiannual":2,"Quarterly":4,"Monthly":12}[freq]
 
-# Build flows & accrued
+# ---- Cashflows (pro Stück) & Accrued
 flows, accrued, sched = build_cashflows(settlement, maturity, coupon, nominal, freq, day_count)
 accrued_pct = accrued/nominal*100.0
 dirty_pct_input = price_pct + accrued_pct if price_type == "Clean" else price_pct
-dirty_abs_input = dirty_pct_input/100.0*nominal  # Preis je Stück inkl. AI
+dirty_abs_input = dirty_pct_input/100.0*nominal  # Dirty-Preis je Stück
 
-# Fit YTM to Dirty
+# ---- Fit YTM zum Dirty-Preis
 y_apr = ytm_from_price(dirty_abs_input, settlement, flows, m)
 y_ear = ear_from_apr(y_apr, m)
 mod_dur, convex, dv01, model_dirty = duration_convexity(y_apr, settlement, flows, m)
@@ -241,20 +307,25 @@ mac_dur = macaulay_duration(mod_dur, y_apr, m)
 model_dirty_pct = model_dirty/nominal*100.0
 model_clean_pct = (model_dirty - accrued)/nominal*100.0
 
-# Zero curve & Z-Spread
+# ---- Zero-Kurve & Z-Spread
 t_nodes, r_nodes = build_zero_curve(curve_mode, bench_flat, r_short, r_long)
 z = solve_z_spread(dirty_abs_input, flows, settlement, t_nodes, r_nodes)
 
-# Horizon-Returns
+# ---- Horizon-Returns & Gesamtverzinsung
 TR_12 = horizon_return(12, settlement, maturity, coupon, nominal, freq, day_count, y_apr,
                        reinvest_mode, cash_rate/100.0, t_nodes, r_nodes)
 TR_24 = horizon_return(24, settlement, maturity, coupon, nominal, freq, day_count, y_apr,
                        reinvest_mode, cash_rate/100.0, t_nodes, r_nodes)
+TR_MAT = total_return_to_maturity(settlement, maturity, coupon, nominal, freq, day_count, y_apr,
+                                  reinvest_mode, cash_rate/100.0, t_nodes, r_nodes)
+MOIC_MAT = 1.0 + TR_MAT
 
-# Credit
+# ---- Credit
 lam = solve_hazard_from_price(dirty_abs_input, flows, settlement, t_nodes, r_nodes, recovery, nominal)
 
-# ---------------- Investment: Stückzahl & Cashflows skaliert
+# =========================
+# Investment: Stückzahl & Cashflow-Skalierung
+# =========================
 if dirty_abs_input <= 0:
     units = 0.0
 else:
@@ -263,8 +334,8 @@ else:
 
 invested_dirty = units * dirty_abs_input
 
-def cf_table_scaled(settlement: date, flows, nominal, coupon, units: float):
-    """Erzeuge detaillierte CF-Tabelle (je Termin) skaliert auf Stückzahl."""
+def cf_table_scaled(settlement: date, flows, nominal, units: float):
+    """Detailierte CF-Tabelle (je Termin) skaliert auf Stückzahl; mit initialem Dirty-Outflow."""
     rows = []
     last_dt = flows[-1][0] if flows else settlement
     for dt, amt in flows:
@@ -283,8 +354,7 @@ def cf_table_scaled(settlement: date, flows, nominal, coupon, units: float):
     df = pd.DataFrame(rows)
     for col in ["Coupon_per_1","Principal_per_1","Total_per_1"]:
         df[col.replace("_per_1","")] = df[col] * units
-    df["Cum_Total"] = df["Total"].cumsum()
-    # initial outflow (dirty)
+    # Initialer Kauf-CF (Dirty)
     init = pd.DataFrame([{
         "Date": pd.Timestamp(settlement).date(),
         "Year": pd.Timestamp(settlement).year,
@@ -293,19 +363,24 @@ def cf_table_scaled(settlement: date, flows, nominal, coupon, units: float):
         "Coupon_per_1": 0.0, "Principal_per_1": 0.0, "Total_per_1": -dirty_abs_input,
         "Coupon": 0.0, "Principal": 0.0, "Total": -invested_dirty
     }])
-    init["Cum_Total"] = init["Total"]
     df = pd.concat([init, df], ignore_index=True).sort_values("Date").reset_index(drop=True)
     df["Cum_Total"] = df["Total"].cumsum()
     return df
 
-df_cf = cf_table_scaled(settlement, flows, nominal, coupon, units)
+df_cf = cf_table_scaled(settlement, flows, nominal, units)
 
 # Aggregationen
 df_month = df_cf.groupby("Month", as_index=False)[["Coupon","Principal","Total"]].sum()
 df_month["DateLabel"] = pd.to_datetime(df_month["Month"] + "-01")
 df_year  = df_cf.groupby("Year", as_index=False)[["Coupon","Principal","Total"]].sum()
 
-# ---------------- Tabs
+# Monatskupon gesamt (KPI)
+coupon_per_1 = (coupon * nominal) / m
+monthly_coupon_total = coupon_per_1 * units if m == 12 else None  # nur "Monthly" exakt "pro Monat"
+
+# =========================
+# Tabs
+# =========================
 tab_ov, tab_credit, tab_cf = st.tabs(["Overview", "Credit & Stress", "Cashflow-Plan"])
 
 with tab_ov:
@@ -328,12 +403,16 @@ with tab_ov:
     c4.metric("Reinvest-Modus", reinvest_mode)
     c5.metric("Geldmarktsatz (fix)", f"{cash_rate:.2f}% p.a.")
     c6.metric("Zero-Kurve: Kurz/Lang", f"{r_short:.2f}% / {r_long:.2f}%")
-    d1, d2 = st.columns(2)
+
+    d1, d2, d3 = st.columns(3)
     d1.metric("12M Horizon TR", f"{TR_12*100:.2f}%")
     d2.metric("24M Horizon TR", f"{TR_24*100:.2f}%")
+    d3.metric("Gesamtverzinsung bis Fälligkeit", f"{TR_MAT*100:.2f}%")
+    st.metric("MOIC bis Fälligkeit", f"{MOIC_MAT:.2f}x")
 
     st.divider()
-    # Price ↔ Yield
+    # Chart 1: Price ↔ Yield
+    st.subheader("Price ↔ Yield")
     ys = np.linspace(0.0, max(2.0, y_apr*1.2), 240)
     prices = [price_from_yield(y, settlement, flows, m)/nominal*100.0 for y in ys]
     fig_py = go.Figure()
@@ -342,6 +421,18 @@ with tab_ov:
     fig_py.update_layout(template="plotly_white", height=320, xaxis_title="Yield (APR, %)", yaxis_title="Price (% of Par)")
     st.plotly_chart(fig_py, use_container_width=True)
 
+    # Chart 2: Zero vs Zero+Z
+    st.subheader("Zero-Kurve vs Zero+Z")
+    T_end = max((sched[-1]-settlement).days/365.0, float(t_nodes[-1]))
+    ts = np.linspace(0.0, T_end, 70)
+    base = [interp_zero(t_nodes, r_nodes, t)*100 for t in ts]
+    plus = [(interp_zero(t_nodes, r_nodes, t)+z)*100 for t in ts]
+    fig_curve = go.Figure()
+    fig_curve.add_trace(go.Scatter(x=ts, y=base, name="Zero", mode="lines"))
+    fig_curve.add_trace(go.Scatter(x=ts, y=plus, name="Zero + Z", mode="lines"))
+    fig_curve.update_layout(template="plotly_white", height=320, xaxis_title="t (Jahre)", yaxis_title="Rate (% p.a.)")
+    st.plotly_chart(fig_curve, use_container_width=True)
+
 with tab_credit:
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Implizite Hazard λ", f"{lam*100:.2f}% p.a.")
@@ -349,12 +440,15 @@ with tab_credit:
     c3.metric("PD 3Y", f"{(1-math.exp(-lam*3.0))*100:.2f}%")
     c4.metric("PD 5Y", f"{(1-math.exp(-lam*5.0))*100:.2f}%")
 
+    # Chart 3: Survival
+    st.subheader("Survival-Kurve S(t)")
     Ts = np.linspace(0, (sched[-1]-settlement).days/365.0, 60)
     S  = [math.exp(-lam*t) for t in Ts]
     figS = go.Figure(go.Scatter(x=Ts, y=S, mode="lines", name="S(t)"))
     figS.update_layout(template="plotly_white", height=300, xaxis_title="t (Jahre)", yaxis_title="S(t)")
     st.plotly_chart(figS, use_container_width=True)
 
+    st.divider()
     st.subheader("Tornado — ΔPrice (Dirty) in Punkten")
     scenarios = []
     y_up = price_from_yield(y_apr+0.01, settlement, flows, m)
@@ -385,15 +479,31 @@ with tab_cf:
     c2.metric("Preis (Dirty) je Stück", f"{dirty_abs_input:,.2f}")
     c3.metric("Stückzahl", f"{units:,.4f}" if not integer_pcs else f"{int(units)}")
 
+    if monthly_coupon_total is not None:
+        st.metric("Monatskupon (gesamt)", f"{monthly_coupon_total:,.2f}")
+
+    endwert_mat = invested_dirty * MOIC_MAT if invested_dirty > 0 else 0.0
+    st.metric("Endwert bis Fälligkeit (modelliert)", f"{endwert_mat:,.2f}")
+
     st.caption("Hinweis: Bei 'Ganzzahlige Stückzahl' wird abgerundet. Start-Cashflow = negativer Dirty-Kaufpreis.")
+
     st.subheader("Cashflow je Termin (skalierte Beträge)")
-    st.dataframe(df_cf.style.format({"Coupon":"{:,.2f}","Principal":"{:,.2f}","Total":"{:,.2f}","Cum_Total":"{:,.2f}"}), use_container_width=True)
+    st.dataframe(
+        df_cf.style.format({"Coupon":"{:,.2f}","Principal":"{:,.2f}","Total":"{:,.2f}","Cum_Total":"{:,.2f}"}),
+        use_container_width=True
+    )
 
     st.subheader("Aggregation nach Monat")
-    st.dataframe(df_month[["Month","Coupon","Principal","Total"]].style.format({"Coupon":"{:,.2f}","Principal":"{:,.2f}","Total":"{:,.2f}"}), use_container_width=True)
+    st.dataframe(
+        df_month[["Month","Coupon","Principal","Total"]].style.format({"Coupon":"{:,.2f}","Principal":"{:,.2f}","Total":"{:,.2f}"}),
+        use_container_width=True
+    )
 
     st.subheader("Aggregation nach Jahr")
-    st.dataframe(df_year[["Year","Coupon","Principal","Total"]].style.format({"Coupon":"{:,.2f}","Principal":"{:,.2f}","Total":"{:,.2f}"}), use_container_width=True)
+    st.dataframe(
+        df_year[["Year","Coupon","Principal","Total"]].style.format({"Coupon":"{:,.2f}","Principal":"{:,.2f}","Total":"{:,.2f}"}),
+        use_container_width=True
+    )
 
     st.subheader("Cashflow Timeline (Monate)")
     fig_cf = go.Figure()
@@ -403,4 +513,4 @@ with tab_cf:
                          xaxis_title="Monat", yaxis_title="Betrag (investitionsskaliert)")
     st.plotly_chart(fig_cf, use_container_width=True)
 
-st.caption("© Bond Lab — LITE (Core+CF). Preise in Nominalwährung; Cashflows skaliert mit Stückzahl. Dirty-Kaufpreis als negativer Start-CF.")
+st.caption("© Bond Lab — LITE (Core+CF). Preise in Nominalwährung; Dirty→Dirty-Logik; Reinvest gemäß Auswahl (Zero-Kurve oder Geldmarkt fix).")
